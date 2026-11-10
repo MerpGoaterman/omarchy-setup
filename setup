@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+# Bootstrap a new Omarchy machine with this account's agent setup.
+# Run from a terminal so GitHub login and the Connect token prompt work:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/MerpGoaterman/omarchy-setup/main/setup)
+set -euo pipefail
+
+die() {
+  echo "setup: $*" >&2
+  exit 1
+}
+
+origin_ok() {
+  local url=$1 repo=$2 bare
+  bare=${url%.git}
+  bare=${bare%/}
+  [[ $bare == *"github.com/MerpGoaterman/${repo}" || $bare == *"github.com:MerpGoaterman/${repo}" ]]
+}
+
+# Prints "clone" or "update". Exits on a directory we must not touch.
+repo_action() {
+  local repo=$1 dest=$2 url
+  if [[ ! -e $dest ]]; then
+    echo clone
+    return 0
+  fi
+  if [[ ! -d $dest/.git ]]; then
+    die "$dest exists and is not a git checkout"
+  fi
+  url=$(git -C "$dest" remote get-url origin)
+  if ! origin_ok "$url" "$repo"; then
+    die "$dest origin is $url"
+  fi
+  echo update
+}
+
+sync_repo() {
+  local repo=$1 dest=$2 action
+  shift 2
+  action=$(repo_action "$repo" "$dest")
+  if [[ $action == clone ]]; then
+    echo "clone MerpGoaterman/$repo -> $dest"
+    gh repo clone "MerpGoaterman/$repo" "$dest" "$@"
+  else
+    echo "update $dest"
+    git -C "$dest" pull --ff-only --recurse-submodules
+  fi
+}
+
+memory_paths() {
+  printf '%s\n' \
+    "$HOME/.agent/GLOBAL.md" \
+    "$HOME/.claude/CLAUDE.md" \
+    "$HOME/.codex/AGENTS.md" \
+    "$HOME/.config/opencode/AGENTS.md" \
+    "$HOME/.grok/AGENTS.md" \
+    "$HOME/agent-memory/GLOBAL.md"
+}
+
+# Existing agent files may be replaced only when they already match agents.md.
+check_memory_files() {
+  local agents=$1 path target want bad=0
+  want=$(readlink -f "$agents")
+  while IFS= read -r path; do
+    [[ -e $path || -L $path ]] || continue
+    if [[ -L $path ]]; then
+      target=$(readlink -f "$path")
+      if [[ $target == "$want" ]]; then
+        continue
+      fi
+    fi
+    if cmp -s "$path" "$agents"; then
+      continue
+    fi
+    echo "setup: $path differs from $agents" >&2
+    diff -u "$path" "$agents" >&2 || true
+    bad=1
+  done < <(memory_paths)
+  [[ $bad -eq 0 ]]
+}
+
+# Leave an existing path alone, including stock Omarchy skill links.
+place_link() {
+  local dest=$1 target=$2 current
+  mkdir -p "$(dirname "$dest")"
+  if [[ -e $dest || -L $dest ]]; then
+    current=$(readlink "$dest" || true)
+    if [[ $current == "$target" ]]; then
+      return 0
+    fi
+    echo "leave $dest"
+    return 0
+  fi
+  ln -s "$target" "$dest"
+  echo "link $dest"
+}
+
+link_skills() {
+  local skill name
+  mkdir -p \
+    "$HOME/.agents/skills" \
+    "$HOME/.claude/skills" \
+    "$HOME/.codex/skills" \
+    "$HOME/.grok/skills"
+  shopt -s nullglob
+  for skill in "$HOME/dotskills/skills/"*/SKILL.md; do
+    name=$(basename "$(dirname "$skill")")
+    place_link "$HOME/.agents/skills/$name" "$HOME/dotskills/skills/$name"
+    place_link "$HOME/.claude/skills/$name" "../../.agents/skills/$name"
+    place_link "$HOME/.codex/skills/$name" "$HOME/.agents/skills/$name"
+    place_link "$HOME/.grok/skills/$name" "../../.agents/skills/$name"
+  done
+  shopt -u nullglob
+  if [[ -d $HOME/dotskills/skills/ponytail ]]; then
+    mkdir -p "$HOME/.local/share/ponytail"
+    place_link "$HOME/.local/share/ponytail/AGENTS.md" "$HOME/.agents/skills/ponytail/SKILL.md"
+  fi
+}
+
+write_op_reader() {
+  local dest=$1
+  mkdir -p "$(dirname "$dest")"
+  cat >"$dest" <<'PY'
+#!/usr/bin/env python3
+"""Connect-backed op.
+
+Reads the token from ~/.config/op-connect/config.json and never prints it.
+`read`, `inject`, and `run` go to /usr/bin/op. `vault list` and `item list`
+use the Connect API because the stock CLI rejects those in Connect mode.
+List output is names and ids only.
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CFG = Path.home() / ".config/op-connect/config.json"
+REAL = "/usr/bin/op"
+
+
+def fail(message):
+    sys.stderr.write(message.rstrip() + "\n")
+    sys.exit(1)
+
+
+def load_cfg():
+    try:
+        cfg = json.loads(CFG.read_text())
+        host = cfg["host"].rstrip("/")
+        token = cfg["token"]
+    except (OSError, json.JSONDecodeError, KeyError, AttributeError):
+        fail(f"op-connect: unreadable config at {CFG}")
+    if not isinstance(host, str) or not isinstance(token, str) or not host or not token:
+        fail(f"op-connect: incomplete config at {CFG}")
+    return host, token
+
+
+def api(host, token, path):
+    req = urllib.request.Request(
+        host + path,
+        headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        fail(f"op-connect: {path} returned HTTP {exc.code}")
+    except urllib.error.URLError:
+        fail(f"op-connect: cannot reach {host}")
+
+
+def flag_value(args, name):
+    for i, arg in enumerate(args):
+        if arg == name and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def wants_json(args):
+    return flag_value(args, "--format") == "json"
+
+
+def exec_real(host, token):
+    env = os.environ.copy()
+    env["OP_CONNECT_HOST"] = host
+    env["OP_CONNECT_TOKEN"] = token
+    env.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
+    os.execvpe(REAL, [REAL, *sys.argv[1:]], env)
+
+
+def vault_list(host, token, args):
+    vaults = api(host, token, "/v1/vaults")
+    rows = sorted(
+        ({"id": v.get("id", ""), "name": v.get("name", "")} for v in vaults),
+        key=lambda row: row["name"].lower(),
+    )
+    if wants_json(args):
+        json.dump(rows, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+    print(f"{'ID':<28} NAME")
+    for row in rows:
+        print(f"{row['id']:<28} {row['name']}")
+
+
+def item_rows(host, token, vault):
+    items = api(host, token, f"/v1/vaults/{urllib.parse.quote(vault['id'])}/items")
+    rows = []
+    for item in items:
+        rows.append(
+            {
+                "id": item.get("id", ""),
+                "title": item.get("title", ""),
+                "category": item.get("category", ""),
+                "vault": {"id": vault.get("id", ""), "name": vault.get("name", "")},
+                "updated_at": item.get("updatedAt", ""),
+            }
+        )
+    return rows
+
+
+def item_list(host, token, args):
+    vaults = api(host, token, "/v1/vaults")
+    by_name = {v.get("name", ""): v for v in vaults}
+    chosen = flag_value(args, "--vault")
+    if chosen:
+        vault = by_name.get(chosen)
+        if vault is None:
+            known = ", ".join(sorted(by_name))
+            fail(f"op-connect: no vault named {chosen}. Known: {known}")
+        selected = [vault]
+    elif "--all-vaults" in args:
+        selected = list(vaults)
+    else:
+        vault = by_name.get("Muse Automation")
+        if vault is None:
+            fail("op-connect: Muse Automation is not in the Connect vault list")
+        selected = [vault]
+    rows = []
+    for vault in selected:
+        rows.extend(item_rows(host, token, vault))
+    rows.sort(key=lambda row: (row["vault"]["name"].lower(), row["title"].lower()))
+    if wants_json(args):
+        json.dump(rows, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+    print(f"{'ID':<28} {'VAULT':<18} TITLE")
+    for row in rows:
+        print(f"{row['id']:<28} {row['vault']['name']:<18} {row['title']}")
+
+
+def main():
+    host, token = load_cfg()
+    args = sys.argv[1:]
+    if args[:2] == ["vault", "list"]:
+        vault_list(host, token, args[2:])
+        return
+    if args[:2] == ["item", "list"]:
+        item_list(host, token, args[2:])
+        return
+    exec_real(host, token)
+
+
+if __name__ == "__main__":
+    main()
+PY
+  chmod 755 "$dest"
+}
+
+install_op_reader() {
+  local dest=$HOME/.local/bin/op
+  if [[ -e $dest || -L $dest ]]; then
+    echo "leave $dest"
+    return 0
+  fi
+  write_op_reader "$dest"
+  echo "installed $dest"
+}
+
+install_op_config() {
+  local cfg=$HOME/.config/op-connect/config.json token host old_umask
+  if [[ -f $cfg ]]; then
+    echo "op-connect config already present"
+    return 0
+  fi
+  token=${OP_CONNECT_TOKEN:-}
+  if [[ -z $token && -t 0 ]]; then
+    echo "Paste the OP Connect token. Input stays hidden. Press enter to skip."
+    read -r -s token
+    echo
+  fi
+  if [[ -z $token ]]; then
+    echo "op-connect: write $cfg (mode 600) with host and token, then rerun."
+    return 0
+  fi
+  host=${OP_CONNECT_HOST:-https://op-connect.9o4t.com}
+  mkdir -p "$HOME/.config/op-connect"
+  chmod 700 "$HOME/.config/op-connect"
+  old_umask=$(umask)
+  umask 077
+  OP_CONNECT_HOST=$host OP_CONNECT_TOKEN=$token python3 -c 'import json, os; from pathlib import Path; p = Path.home() / ".config" / "op-connect" / "config.json"; p.write_text(json.dumps({"host": os.environ["OP_CONNECT_HOST"], "token": os.environ["OP_CONNECT_TOKEN"]}) + "\n")'
+  umask "$old_umask"
+  unset token OP_CONNECT_TOKEN
+  chmod 600 "$cfg"
+  if ! "$HOME/.local/bin/op" vault list >/dev/null; then
+    rm -f "$cfg"
+    die "OP Connect rejected that token. The config file was removed."
+  fi
+  echo "wrote $cfg"
+}
+
+self_test() {
+  local fail=0 out
+  SELF_TEST_TMP=$(mktemp -d)
+  trap 'rm -rf "$SELF_TEST_TMP"' EXIT
+
+  origin_ok "https://github.com/MerpGoaterman/dotfiles.git" dotfiles || fail=1
+  origin_ok "git@github.com:MerpGoaterman/dotfiles.git" dotfiles || fail=1
+  if origin_ok "https://github.com/MerpGoaterman/dotfiles-evil.git" dotfiles; then
+    echo "accepted a lookalike repo" >&2
+    fail=1
+  fi
+  if origin_ok "https://github.com/other/dotfiles.git" dotfiles; then
+    echo "accepted another owner" >&2
+    fail=1
+  fi
+
+  out=$(repo_action dotfiles "$SELF_TEST_TMP/missing")
+  [[ $out == clone ]] || fail=1
+
+  mkdir -p "$SELF_TEST_TMP/notgit"
+  if (repo_action dotfiles "$SELF_TEST_TMP/notgit") >/dev/null 2>&1; then
+    echo "accepted a non-repo" >&2
+    fail=1
+  fi
+
+  mkdir -p "$SELF_TEST_TMP/dotfiles"
+  git -C "$SELF_TEST_TMP/dotfiles" init -q
+  git -C "$SELF_TEST_TMP/dotfiles" remote add origin https://github.com/MerpGoaterman/dotfiles.git
+  out=$(repo_action dotfiles "$SELF_TEST_TMP/dotfiles")
+  [[ $out == update ]] || fail=1
+
+  git -C "$SELF_TEST_TMP/dotfiles" remote set-url origin https://github.com/other/dotfiles.git
+  if (repo_action dotfiles "$SELF_TEST_TMP/dotfiles") >/dev/null 2>&1; then
+    echo "accepted the wrong origin" >&2
+    fail=1
+  fi
+
+  mkdir -p "$SELF_TEST_TMP/home/dotfiles" "$SELF_TEST_TMP/home/.claude"
+  printf 'same\n' >"$SELF_TEST_TMP/home/dotfiles/agents.md"
+  printf 'same\n' >"$SELF_TEST_TMP/home/.claude/CLAUDE.md"
+  if ! (HOME=$SELF_TEST_TMP/home check_memory_files "$SELF_TEST_TMP/home/dotfiles/agents.md"); then
+    echo "rejected a matching memory file" >&2
+    fail=1
+  fi
+  printf 'nope\n' >"$SELF_TEST_TMP/home/.claude/CLAUDE.md"
+  if (HOME=$SELF_TEST_TMP/home check_memory_files "$SELF_TEST_TMP/home/dotfiles/agents.md") >/dev/null 2>&1; then
+    echo "accepted a different memory file" >&2
+    fail=1
+  fi
+  ln -sfn "$SELF_TEST_TMP/home/dotfiles/agents.md" "$SELF_TEST_TMP/home/.claude/CLAUDE.md"
+  if ! (HOME=$SELF_TEST_TMP/home check_memory_files "$SELF_TEST_TMP/home/dotfiles/agents.md"); then
+    echo "rejected a correct symlink" >&2
+    fail=1
+  fi
+
+  mkdir -p "$SELF_TEST_TMP/home/.agents/skills"
+  ln -s /usr/share/omarchy/default/agents/skills/omarchy "$SELF_TEST_TMP/home/.agents/skills/omarchy"
+  (HOME=$SELF_TEST_TMP/home place_link "$SELF_TEST_TMP/home/.agents/skills/omarchy" "$SELF_TEST_TMP/home/dotskills/skills/omarchy") >/dev/null
+  [[ $(readlink "$SELF_TEST_TMP/home/.agents/skills/omarchy") == /usr/share/omarchy/default/agents/skills/omarchy ]] || fail=1
+  (HOME=$SELF_TEST_TMP/home place_link "$SELF_TEST_TMP/home/.agents/skills/ponytail" "$SELF_TEST_TMP/home/dotskills/skills/ponytail") >/dev/null
+  [[ $(readlink "$SELF_TEST_TMP/home/.agents/skills/ponytail") == "$SELF_TEST_TMP/home/dotskills/skills/ponytail" ]] || fail=1
+
+  write_op_reader "$SELF_TEST_TMP/op"
+  python3 -m py_compile "$SELF_TEST_TMP/op"
+
+  if [[ $fail -ne 0 ]]; then
+    die "self-test failed"
+  fi
+  echo "self-test ok"
+}
+
+if [[ ${1:-} == --self-test ]]; then
+  self_test
+  exit 0
+fi
+
+[[ ${EUID:-$(id -u)} -ne 0 ]] || die "run this as your user, not root"
+[[ -t 0 ]] || die "run: bash <(curl -fsSL https://raw.githubusercontent.com/MerpGoaterman/omarchy-setup/main/setup)"
+[[ -d /usr/share/omarchy ]] || die "this script is for an Omarchy machine"
+command -v omarchy >/dev/null || die "omarchy is not on PATH"
+
+# shellcheck disable=SC1091
+. /usr/share/omarchy/default/bash/env-bootstrap
+
+for pkg in git python ripgrep; do
+  if ! pacman -Q "$pkg" >/dev/null 2>&1; then
+    sudo pacman -S --needed --noconfirm -- "$pkg"
+  fi
+done
+command -v gh >/dev/null || die "gh is missing. Open an Omarchy terminal so mise can provide it."
+command -v node >/dev/null || die "node is missing. Open an Omarchy terminal so mise can provide it."
+command -v npm >/dev/null || die "npm is missing. Open an Omarchy terminal so mise can provide it."
+
+if gh auth status >/dev/null 2>&1; then
+  echo "GitHub: logged in"
+else
+  echo "GitHub: log in. The private repos need this account."
+  gh auth login
+fi
+gh auth setup-git
+export GIT_TERMINAL_PROMPT=0
+
+sync_repo dotfiles "$HOME/dotfiles" -- --recurse-submodules
+sync_repo dotskills "$HOME/dotskills"
+sync_repo memories "$HOME/memories"
+
+check_memory_files "$HOME/dotfiles/agents.md" || die "an agent memory file differs. Say so before replacing it."
+"$HOME/dotfiles/install"
+
+link_skills
+
+if [[ ! -e $HOME/.agents/skills/find-skills && ! -L $HOME/.agents/skills/find-skills ]]; then
+  npx --yes skills add vercel-labs/skills --skill find-skills -g -y -a claude-code codex cursor grok pi
+fi
+if [[ -d $HOME/.agents/skills/find-skills || -L $HOME/.agents/skills/find-skills ]]; then
+  place_link "$HOME/.claude/skills/find-skills" "../../.agents/skills/find-skills"
+  place_link "$HOME/.codex/skills/find-skills" "$HOME/.agents/skills/find-skills"
+  place_link "$HOME/.grok/skills/find-skills" "../../.agents/skills/find-skills"
+fi
+
+if ! command -v mem >/dev/null 2>&1; then
+  npm i -g @masculinecache/mem-axi --prefix "$HOME/.local"
+fi
+command -v mem >/dev/null || die "mem did not land on PATH"
+
+if [[ -z $(git -C "$HOME/memories" config --get user.name || true) ]]; then
+  git -C "$HOME/memories" config user.name "$(git -C "$HOME/memories" log -1 --format=%an)"
+  git -C "$HOME/memories" config user.email "$(git -C "$HOME/memories" log -1 --format=%ae)"
+fi
+git -C "$HOME/memories" config init.defaultBranch main
+
+install_op_reader
+install_op_config
+
+echo "mem sync"
+mem sync
+
+echo
+echo "done on $(hostname)"
+echo "Connect reader: $HOME/.local/bin/op"
+echo "Tailscale is still a separate login: tailscale up"
